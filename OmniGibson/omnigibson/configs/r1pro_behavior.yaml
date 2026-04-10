@@ -112,3 +112,9 @@ task:
     max_steps: 500
   reward_config:
     r_potential: 1.0
+    # Optional dense shaping toward an expert-demo EEF trajectory.
+    # Active only when both keys are set. The .npy file lives under
+    # OmniGibson/omnigibson/reward_functions/demo_data/. Currently
+    # bundled: turning_on_radio_eef.npy (1956 frames @ 30Hz, ep10).
+    r_demo_dist_coeff: 1.0
+    demo_eef_file: turning_on_radio_eef.npy

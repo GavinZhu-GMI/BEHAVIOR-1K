@@ -212,6 +212,23 @@ class BehaviorTask(BaseTask):
             r_potential=self._reward_config["r_potential"],
         )
 
+        # Optional dense shaping: per-step distance from current EEF to an
+        # expert-demo EEF trajectory at the matching timestep. Provides a
+        # gradient signal for tasks where BDDL goal predicates are too
+        # coarse for a randomly-initialized policy to bootstrap from. Only
+        # active when the reward_config supplies both r_demo_dist_coeff and
+        # demo_eef_file.
+        demo_coeff = float(self._reward_config.get("r_demo_dist_coeff", 0.0) or 0.0)
+        demo_file = self._reward_config.get("demo_eef_file", None)
+        if demo_coeff > 0 and demo_file:
+            from omnigibson.reward_functions.demo_eef_distance_reward import (
+                DemoEEFDistanceReward,
+            )
+            rewards["demo_eef_distance"] = DemoEEFDistanceReward(
+                demo_file=demo_file,
+                dist_coeff=demo_coeff,
+            )
+
         return rewards
 
     def _load(self, env):

@@ -1,4 +1,5 @@
 from omnigibson.reward_functions.collision_reward import CollisionReward
+from omnigibson.reward_functions.demo_eef_distance_reward import DemoEEFDistanceReward
 from omnigibson.reward_functions.grasp_reward import GraspReward
 from omnigibson.reward_functions.point_goal_reward import PointGoalReward
 from omnigibson.reward_functions.potential_reward import PotentialReward
@@ -8,6 +9,7 @@ from omnigibson.reward_functions.reward_function_base import REGISTERED_REWARD_F
 __all__ = [
     "BaseRewardFunction",
     "CollisionReward",
+    "DemoEEFDistanceReward",
     "GraspReward",
     "PointGoalReward",
     "PotentialReward",
