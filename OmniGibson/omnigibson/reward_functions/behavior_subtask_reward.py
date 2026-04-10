@@ -67,23 +67,51 @@ def _short(name: str) -> str:
     return base.rstrip("_")
 
 
+# DEBUG: temporary one-shot diagnostic prints to verify the reward is wired
+# in correctly and the predicates are actually evaluating against real state.
+# TODO: revert this block once we confirm the failure mode in iter 2.5.
+_DEBUG_SEEN: set[str] = set()
+
+def _debug_once(key: str, msg: str) -> None:
+    if key in _DEBUG_SEEN:
+        return
+    _DEBUG_SEEN.add(key)
+    print(f"[BEHAVIOR_SUBTASK_DEBUG] {msg}", flush=True)
+
+
 def _eef_within(task, env, obj_scope_name: str, threshold: float) -> bool:
     """True if either of the robot's end-effectors is within `threshold`
     meters of the BDDL-bound object's position."""
     try:
         obj = task.object_scope[obj_scope_name].wrapped_obj
         obj_pos, _ = obj.states[Pose].get_value()
-    except Exception:
+    except Exception as e:
+        _debug_once(
+            f"eef_within_lookup_err::{obj_scope_name}",
+            f"_eef_within({obj_scope_name}): object lookup FAILED: {type(e).__name__}: {e}",
+        )
         return False
     robot = env.robots[0]
     arm_names = list(robot.arm_names) if hasattr(robot, "arm_names") else [robot.default_arm]
     for arm in arm_names[:2]:
         try:
             eef = robot.get_eef_position(arm)
-        except Exception:
+        except Exception as e:
+            _debug_once(
+                f"eef_within_arm_err::{arm}",
+                f"_eef_within: get_eef_position({arm}) FAILED: {type(e).__name__}: {e}",
+            )
             continue
-        if T.l2_distance(th.as_tensor(eef, dtype=th.float32),
-                          th.as_tensor(obj_pos, dtype=th.float32)).item() < threshold:
+        dist = T.l2_distance(
+            th.as_tensor(eef, dtype=th.float32),
+            th.as_tensor(obj_pos, dtype=th.float32),
+        ).item()
+        _debug_once(
+            f"eef_within_first::{obj_scope_name}::{arm}",
+            f"_eef_within({obj_scope_name}, {arm}): first call dist={dist:.3f}m, threshold={threshold}m, "
+            f"obj_pos={[round(float(x), 3) for x in obj_pos]}, eef={[round(float(x), 3) for x in eef]}",
+        )
+        if dist < threshold:
             return True
     return False
 
@@ -93,8 +121,24 @@ def _robot_touching(task, env, obj_scope_name: str) -> bool:
     BDDL-bound object. Uses OmniGibson's Touching state internally."""
     try:
         obj = task.object_scope[obj_scope_name].wrapped_obj
-        return bool(obj.states[Touching].get_value(env.robots[0]))
-    except Exception:
+    except Exception as e:
+        _debug_once(
+            f"touching_lookup_err::{obj_scope_name}",
+            f"_robot_touching({obj_scope_name}): object lookup FAILED: {type(e).__name__}: {e}",
+        )
+        return False
+    try:
+        result = bool(obj.states[Touching].get_value(env.robots[0]))
+        _debug_once(
+            f"touching_first::{obj_scope_name}",
+            f"_robot_touching({obj_scope_name}): first call returned {result}",
+        )
+        return result
+    except Exception as e:
+        _debug_once(
+            f"touching_eval_err::{obj_scope_name}",
+            f"_robot_touching({obj_scope_name}): Touching.get_value FAILED: {type(e).__name__}: {e}",
+        )
         return False
 
 
@@ -104,8 +148,24 @@ def _robot_grasping(task, env, obj_scope_name: str) -> bool:
     `_ag_obj_in_hand[arm] == obj` for each arm."""
     try:
         obj = task.object_scope[obj_scope_name].wrapped_obj
-        return bool(env.robots[0].states[IsGrasping].get_value(obj))
-    except Exception:
+    except Exception as e:
+        _debug_once(
+            f"grasping_lookup_err::{obj_scope_name}",
+            f"_robot_grasping({obj_scope_name}): object lookup FAILED: {type(e).__name__}: {e}",
+        )
+        return False
+    try:
+        result = bool(env.robots[0].states[IsGrasping].get_value(obj))
+        _debug_once(
+            f"grasping_first::{obj_scope_name}",
+            f"_robot_grasping({obj_scope_name}): first call returned {result}",
+        )
+        return result
+    except Exception as e:
+        _debug_once(
+            f"grasping_eval_err::{obj_scope_name}",
+            f"_robot_grasping({obj_scope_name}): IsGrasping.get_value FAILED: {type(e).__name__}: {e}",
+        )
         return False
 
 
@@ -420,6 +480,8 @@ class BehaviorSubtaskReward(BaseRewardFunction):
         self._subtasks: list[tuple[str, Callable, float]] = []
         self._fired: dict[str, bool] = {}
         self._activity_name: str | None = None
+        # DEBUG: confirm instantiation reaches here.
+        print(f"[BEHAVIOR_SUBTASK_DEBUG] BehaviorSubtaskReward.__init__(scale={scale})", flush=True)
 
     def _ensure_loaded(self, task) -> None:
         if self._activity_name is not None:
@@ -427,11 +489,19 @@ class BehaviorSubtaskReward(BaseRewardFunction):
         self._activity_name = getattr(task, "activity_name", None) or "<unknown>"
         self._subtasks = get_subtasks_for_task(self._activity_name)
         self._fired = {name: False for name, _, _ in self._subtasks}
+        # DEBUG: confirm _ensure_loaded reaches here AND logs in print form
+        # (the OmniGibson logger.info goes nowhere because root logger level is WARNING).
+        names = [n for n, _, _ in self._subtasks]
+        print(
+            f"[BEHAVIOR_SUBTASK_DEBUG] _ensure_loaded: activity='{self._activity_name}', "
+            f"n_subtasks={len(self._subtasks)}, names={names}, scale={self._scale}",
+            flush=True,
+        )
         if self._subtasks:
-            names = ", ".join(name for name, _, _ in self._subtasks)
+            ns = ", ".join(names)
             logger.info(
                 f"BehaviorSubtaskReward enabled for activity '{self._activity_name}': "
-                f"{len(self._subtasks)} subtasks ({names}), scale={self._scale}"
+                f"{len(self._subtasks)} subtasks ({ns}), scale={self._scale}"
             )
         else:
             logger.info(
