@@ -179,7 +179,18 @@ def _robot_grasping(task, env, obj_scope_name: str) -> bool:
 # close over the same loop variable.
 # ---------------------------------------------------------------------------
 
-NEAR_THRESHOLD = 0.25  # meters; EEF-to-object distance for "near" predicates
+# meters; EEF-to-object distance for "near_X" subtask predicates.
+# Temporarily 2.5m for iter 3-A: random-init policy starts ~2m from
+# the radio in turning_on_radio (verified via debug prints, EEF at
+# (5.5, 5.4, 0.66), radio at (3.46, 4.89, 0.53), dist=2.14m). With
+# the original 0.25m threshold, the binary subtask never fires across
+# 5 PPO steps (reward_nonzero_frac=0). 2.5m is intentionally loose
+# enough that the very first step satisfies near_X for the active
+# task — sanity check that the latched-bonus plumbing actually
+# produces gradient when the predicate transitions. Iter 3-B will
+# replace this with bounded continuous distance shaping that
+# provides gradient before threshold crossing.
+NEAR_THRESHOLD = 2.5
 
 
 def _template_unary_state(args: list[str]) -> list[tuple[str, Callable, float]]:
