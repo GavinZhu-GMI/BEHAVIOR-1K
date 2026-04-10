@@ -698,4 +698,10 @@ class BehaviorTask(BaseTask):
     def default_reward_config(cls):
         return {
             "r_potential": 1.0,
+            # Optional dense shaping toward an expert-demo EEF trajectory.
+            # Both must be set to enable the reward; defaults are no-op
+            # so existing tasks/configs that don't use the dense shaping
+            # continue to work unchanged.
+            "r_demo_dist_coeff": 0.0,
+            "demo_eef_file": None,
         }
