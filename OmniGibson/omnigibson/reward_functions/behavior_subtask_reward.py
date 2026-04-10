@@ -1,33 +1,42 @@
-"""One-shot latched per-subtask bonuses for BEHAVIOR PPO bootstrapping.
+"""Latched subtask bonuses + bounded continuous distance bridge for BEHAVIOR PPO.
 
 Implements the classical "staged dense reward" pattern (reach → grasp →
 lift → place from robosuite Pick-and-Place) but adapted to BEHAVIOR-1K
-tasks. Each subtask is a boolean predicate evaluated per env step from
-world state. The first time a predicate becomes True within an episode,
-the corresponding bonus is added once. Subsequent steps within the same
-episode never re-emit the same bonus (latched). On episode reset, all
-latch flags clear.
+tasks. Each task's BDDL goal is decomposed into subtasks of two kinds:
 
-Why latched + boolean (vs continuous distance shaping):
-    A bonus that fires once and cannot be farmed avoids the reward-hacking
-    failure mode of continuous distance shaping (e.g. policy hovers near
-    target object accumulating delta-distance reward without ever
-    completing the task).
+  1. **Latched bonuses**: a bonus emitted ONCE per episode the first
+     time the corresponding boolean predicate becomes True. Cannot be
+     farmed (no marginal reward after the first crossing). Examples for
+     a (toggled_on radio) goal: `near_radio` (0.3), `touching_radio` (0.5).
+
+  2. **Continuous delta bridges** (NEW in iter 3-B): per-step
+     potential-style distance shaping that pulls the EEF toward a target
+     object until the corresponding `near_X` latched bonus fires, then
+     gates off. Form: `(prev_dist - current_dist) * coeff`, telescoping
+     over the episode to `(initial_dist - final_dist) * coeff`. Bounded
+     per-episode total ≈ initial_dist × coeff regardless of episode
+     length, so the shaping cannot dominate the terminal PotentialReward
+     via accumulation. Hovering produces zero net delta.
+
+     Why we need both kinds: iter 2.5 with only latched binary bonuses
+     produced reward_nonzero_frac=0 across 5 PPO steps. The random-init
+     R1Pro starts ~2 m from the target object, and a 0.25 m near
+     threshold is unreachable from random exploration in 500-step
+     episodes. The continuous bridge provides gradient *before* the
+     threshold is crossed, so the policy has something to descend.
+
+     Why this isn't the same imitation problem we had with
+     DemoEEFDistanceReward: the target is the BDDL goal's actual
+     argument object (taken from the task's BDDL `(:goal ...)` block),
+     not a fixed expert trajectory. Multiple valid policies can satisfy
+     "approach the radio". The shaping just says "go toward this thing".
 
 Architecture: BDDL-predicate templates + per-task overrides
     Most BEHAVIOR-1K tasks have flat `(and ...)` goal conjunctions of
     well-known BDDL predicates (`inside`, `ontop`, `nextto`, `under`,
     `touching`, `attached`, `toggled_on`, `open`, etc.). For each
-    templatable BDDL predicate we register a function that auto-derives
-    the natural staged decomposition:
-        (toggled_on X)         → near_X → touching_X
-        (open X)               → near_X → touching_X
-        (inside X Y)           → near_X → grasping_X → near_Y
-        (ontop X Y)            → near_X → grasping_X → near_Y
-        ... etc.
-    Each task's goal predicates (parsed from its BDDL `(:goal ...)` block
-    at module-load time and stored in TASK_GOAL_PREDICATES) are run
-    through these templates to produce the subtask list automatically.
+    templatable predicate we register a function that auto-derives the
+    subtask list (latched + continuous) from the goal predicate's args.
 
     Tasks with non-templatable predicates (`covered`, `cooked`,
     `on_fire`, `real`, `contains`, `filled`) — typically cleaning and
@@ -38,11 +47,11 @@ Architecture: BDDL-predicate templates + per-task overrides
 
 This reward composes additively with the existing PotentialReward
 (which handles the BDDL goal predicate via potential delta) — subtask
-bonuses are intermediate stepping stones, not a replacement for the
-goal signal.
+bonuses + continuous bridges are intermediate stepping stones, not a
+replacement for the goal signal.
 """
 
-from typing import Callable
+from typing import Any, Callable, Optional
 
 import torch as th
 
@@ -55,9 +64,10 @@ logger = create_module_logger("BehaviorSubtaskReward")
 
 
 # ---------------------------------------------------------------------------
-# Predicate helper primitives. Each takes (task, env, ...) and returns bool.
-# Defensive — return False on any lookup error so a missing object never
-# crashes the reward.
+# Predicate helper primitives. Each takes (task, env, ...) and returns either
+# a bool (for latched predicates) or a float (for continuous distance).
+# Defensive — return False / None on any lookup error so a missing object
+# never crashes the reward.
 # ---------------------------------------------------------------------------
 
 # Object-name shortener for log/info field readability — strips the BDDL
@@ -67,53 +77,34 @@ def _short(name: str) -> str:
     return base.rstrip("_")
 
 
-# DEBUG: temporary one-shot diagnostic prints to verify the reward is wired
-# in correctly and the predicates are actually evaluating against real state.
-# TODO: revert this block once we confirm the failure mode in iter 2.5.
-_DEBUG_SEEN: set[str] = set()
-
-def _debug_once(key: str, msg: str) -> None:
-    if key in _DEBUG_SEEN:
-        return
-    _DEBUG_SEEN.add(key)
-    print(f"[BEHAVIOR_SUBTASK_DEBUG] {msg}", flush=True)
-
-
-def _eef_within(task, env, obj_scope_name: str, threshold: float) -> bool:
-    """True if either of the robot's end-effectors is within `threshold`
-    meters of the BDDL-bound object's position."""
+def _eef_to_obj_min_distance(task, env, obj_scope_name: str) -> Optional[float]:
+    """Return min L2 distance from any of the robot's end-effectors to the
+    BDDL-bound object's position. None on lookup error."""
     try:
         obj = task.object_scope[obj_scope_name].wrapped_obj
         obj_pos, _ = obj.states[Pose].get_value()
-    except Exception as e:
-        _debug_once(
-            f"eef_within_lookup_err::{obj_scope_name}",
-            f"_eef_within({obj_scope_name}): object lookup FAILED: {type(e).__name__}: {e}",
-        )
-        return False
+    except Exception:
+        return None
     robot = env.robots[0]
     arm_names = list(robot.arm_names) if hasattr(robot, "arm_names") else [robot.default_arm]
+    obj_t = th.as_tensor(obj_pos, dtype=th.float32)
+    best: Optional[float] = None
     for arm in arm_names[:2]:
         try:
             eef = robot.get_eef_position(arm)
-        except Exception as e:
-            _debug_once(
-                f"eef_within_arm_err::{arm}",
-                f"_eef_within: get_eef_position({arm}) FAILED: {type(e).__name__}: {e}",
-            )
+        except Exception:
             continue
-        dist = T.l2_distance(
-            th.as_tensor(eef, dtype=th.float32),
-            th.as_tensor(obj_pos, dtype=th.float32),
-        ).item()
-        _debug_once(
-            f"eef_within_first::{obj_scope_name}::{arm}",
-            f"_eef_within({obj_scope_name}, {arm}): first call dist={dist:.3f}m, threshold={threshold}m, "
-            f"obj_pos={[round(float(x), 3) for x in obj_pos]}, eef={[round(float(x), 3) for x in eef]}",
-        )
-        if dist < threshold:
-            return True
-    return False
+        d = T.l2_distance(th.as_tensor(eef, dtype=th.float32), obj_t).item()
+        if best is None or d < best:
+            best = d
+    return best
+
+
+def _eef_within(task, env, obj_scope_name: str, threshold: float) -> bool:
+    """True if the closest EEF is within `threshold` meters of the
+    BDDL-bound object."""
+    d = _eef_to_obj_min_distance(task, env, obj_scope_name)
+    return d is not None and d < threshold
 
 
 def _robot_touching(task, env, obj_scope_name: str) -> bool:
@@ -121,114 +112,118 @@ def _robot_touching(task, env, obj_scope_name: str) -> bool:
     BDDL-bound object. Uses OmniGibson's Touching state internally."""
     try:
         obj = task.object_scope[obj_scope_name].wrapped_obj
-    except Exception as e:
-        _debug_once(
-            f"touching_lookup_err::{obj_scope_name}",
-            f"_robot_touching({obj_scope_name}): object lookup FAILED: {type(e).__name__}: {e}",
-        )
-        return False
-    try:
-        result = bool(obj.states[Touching].get_value(env.robots[0]))
-        _debug_once(
-            f"touching_first::{obj_scope_name}",
-            f"_robot_touching({obj_scope_name}): first call returned {result}",
-        )
-        return result
-    except Exception as e:
-        _debug_once(
-            f"touching_eval_err::{obj_scope_name}",
-            f"_robot_touching({obj_scope_name}): Touching.get_value FAILED: {type(e).__name__}: {e}",
-        )
+        return bool(obj.states[Touching].get_value(env.robots[0]))
+    except Exception:
         return False
 
 
 def _robot_grasping(task, env, obj_scope_name: str) -> bool:
     """True if the robot is currently grasping the BDDL-bound object via
-    any arm. Uses OmniGibson's IsGrasping robot state, which checks
-    `_ag_obj_in_hand[arm] == obj` for each arm."""
+    any arm. Uses OmniGibson's IsGrasping robot state."""
     try:
         obj = task.object_scope[obj_scope_name].wrapped_obj
-    except Exception as e:
-        _debug_once(
-            f"grasping_lookup_err::{obj_scope_name}",
-            f"_robot_grasping({obj_scope_name}): object lookup FAILED: {type(e).__name__}: {e}",
-        )
-        return False
-    try:
-        result = bool(env.robots[0].states[IsGrasping].get_value(obj))
-        _debug_once(
-            f"grasping_first::{obj_scope_name}",
-            f"_robot_grasping({obj_scope_name}): first call returned {result}",
-        )
-        return result
-    except Exception as e:
-        _debug_once(
-            f"grasping_eval_err::{obj_scope_name}",
-            f"_robot_grasping({obj_scope_name}): IsGrasping.get_value FAILED: {type(e).__name__}: {e}",
-        )
+        return bool(env.robots[0].states[IsGrasping].get_value(obj))
+    except Exception:
         return False
 
 
 # ---------------------------------------------------------------------------
-# BDDL-predicate templates. Each takes a list of object args (instance
-# names, e.g. "radio_receiver.n.01_1") and returns a list of subtasks
-# in the form (subtask_name, fn(task, env) -> bool, bonus_value).
+# Subtask schema
 #
-# The default-arg trick (`o=obj`) on each lambda captures the object name
-# by value at definition time — without it, all lambdas in a loop would
-# close over the same loop variable.
+# Each subtask is a dict with at minimum a "name" and a "kind" field. Two
+# kinds supported:
+#
+#   {"name": str, "kind": "latched",
+#    "fn": Callable[[task, env], bool], "bonus": float}
+#       Fires `bonus * scale` once per episode the first time `fn` is True.
+#       Subsequent steps emit 0 until reset.
+#
+#   {"name": str, "kind": "continuous_delta",
+#    "dist_fn": Callable[[task, env], Optional[float]],
+#    "coeff": float, "gate_off_when": str}
+#       Per-step reward = `(prev_dist - current_dist) * coeff * scale`.
+#       Telescopes to bounded total over the episode.
+#       Becomes inactive once the latched subtask named in `gate_off_when`
+#       has fired (the milestone is passed; further bridge would be noise).
+#
+# Templates produce a mix of both. The resolver returns a flat list of
+# subtask dicts; BehaviorSubtaskReward._step iterates and dispatches by kind.
 # ---------------------------------------------------------------------------
 
-# meters; EEF-to-object distance for "near_X" subtask predicates.
-# Temporarily 2.5m for iter 3-A: random-init policy starts ~2m from
-# the radio in turning_on_radio (verified via debug prints, EEF at
-# (5.5, 5.4, 0.66), radio at (3.46, 4.89, 0.53), dist=2.14m). With
-# the original 0.25m threshold, the binary subtask never fires across
-# 5 PPO steps (reward_nonzero_frac=0). 2.5m is intentionally loose
-# enough that the very first step satisfies near_X for the active
-# task — sanity check that the latched-bonus plumbing actually
-# produces gradient when the predicate transitions. Iter 3-B will
-# replace this with bounded continuous distance shaping that
-# provides gradient before threshold crossing.
-NEAR_THRESHOLD = 2.5
+# meters; EEF-to-object distance for "near_X" latched predicates.
+# Tight enough that "near" actually means "EEF in striking distance",
+# loose enough that the policy can achieve it once the continuous bridge
+# pulls the EEF into the right region.
+NEAR_THRESHOLD = 0.30
 
 
-def _template_unary_state(args: list[str]) -> list[tuple[str, Callable, float]]:
-    """For (toggled_on X), (open X), etc. — single-object state changes.
+# ---------------------------------------------------------------------------
+# BDDL-predicate templates. Each takes a list of object args and returns
+# a flat list of subtask dicts (mix of latched + continuous_delta).
+#
+# Bonus magnitudes are chosen so the total per-episode shaping is in the
+# same band as the terminal PotentialReward (which fires +1.0 on the BDDL
+# goal flip):
+#   continuous bridge per target:  initial_dist × coeff ≈ 1.0 × 0.5 = 0.5
+#   latched near_X:                                              0.2-0.3
+#   latched grasping_X / touching_X:                             0.4-0.5
+#   terminal PotentialReward:                                    1.0
+# ---------------------------------------------------------------------------
 
-    Decomposition: get to the object, then make contact with it. The
-    actual state change (toggle/open) is left to PotentialReward via the
-    BDDL goal evaluation, so we don't double-count it as a subtask.
+
+def _template_unary_state(args: list[str]) -> list[dict[str, Any]]:
+    """For (toggled_on X), (open X) — single-object state changes.
+
+    Decomposition: continuous bridge toward X, latched near_X, latched
+    touching_X. The actual state change (toggle/open) is left to
+    PotentialReward via the BDDL goal evaluation.
     """
     obj = args[0]
     short = _short(obj)
     return [
-        (f"near_{short}",     lambda t, e, o=obj: _eef_within(t, e, o, NEAR_THRESHOLD), 0.3),
-        (f"touching_{short}", lambda t, e, o=obj: _robot_touching(t, e, o),             0.5),
+        {"name": f"delta_to_{short}", "kind": "continuous_delta",
+         "dist_fn": lambda t, e, o=obj: _eef_to_obj_min_distance(t, e, o),
+         "coeff": 0.5, "gate_off_when": f"near_{short}"},
+        {"name": f"near_{short}", "kind": "latched",
+         "fn": lambda t, e, o=obj: _eef_within(t, e, o, NEAR_THRESHOLD),
+         "bonus": 0.3},
+        {"name": f"touching_{short}", "kind": "latched",
+         "fn": lambda t, e, o=obj: _robot_touching(t, e, o),
+         "bonus": 0.5},
     ]
 
 
-def _template_binary_placement(args: list[str]) -> list[tuple[str, Callable, float]]:
+def _template_binary_placement(args: list[str]) -> list[dict[str, Any]]:
     """For (inside X Y), (ontop X Y), (under X Y), (nextto X Y),
     (touching X Y), (attached X Y) — placement of X relative to Y.
 
-    Decomposition: approach X, grasp X, approach Y. The actual relational
-    predicate (X is inside/ontop/under/... Y) is left to PotentialReward
-    via the BDDL goal evaluation.
+    Decomposition: continuous bridges toward both X and Y (independently
+    gated), latched near_X, latched grasping_X, latched near_Y. The
+    actual relational predicate is left to PotentialReward.
     """
     obj, target = args[0], args[1]
     obj_short, target_short = _short(obj), _short(target)
     return [
-        (f"near_{obj_short}",     lambda t, e, o=obj:    _eef_within(t, e, o, NEAR_THRESHOLD), 0.2),
-        (f"grasping_{obj_short}", lambda t, e, o=obj:    _robot_grasping(t, e, o),             0.4),
-        (f"near_{target_short}",  lambda t, e, o=target: _eef_within(t, e, o, NEAR_THRESHOLD + 0.05), 0.3),
+        {"name": f"delta_to_{obj_short}", "kind": "continuous_delta",
+         "dist_fn": lambda t, e, o=obj: _eef_to_obj_min_distance(t, e, o),
+         "coeff": 0.3, "gate_off_when": f"near_{obj_short}"},
+        {"name": f"delta_to_{target_short}", "kind": "continuous_delta",
+         "dist_fn": lambda t, e, o=target: _eef_to_obj_min_distance(t, e, o),
+         "coeff": 0.3, "gate_off_when": f"near_{target_short}"},
+        {"name": f"near_{obj_short}", "kind": "latched",
+         "fn": lambda t, e, o=obj: _eef_within(t, e, o, NEAR_THRESHOLD),
+         "bonus": 0.2},
+        {"name": f"grasping_{obj_short}", "kind": "latched",
+         "fn": lambda t, e, o=obj: _robot_grasping(t, e, o),
+         "bonus": 0.4},
+        {"name": f"near_{target_short}", "kind": "latched",
+         "fn": lambda t, e, o=target: _eef_within(t, e, o, NEAR_THRESHOLD + 0.05),
+         "bonus": 0.3},
     ]
 
 
-# Map BDDL predicate name -> template function. Templatable predicates
-# only; the rest fall through to TASK_SUBTASKS_OVERRIDE or get no
-# shaping.
-GOAL_PREDICATE_TEMPLATES: dict[str, Callable[[list[str]], list[tuple[str, Callable, float]]]] = {
+# Map BDDL predicate name -> template function. Templatable predicates only.
+GOAL_PREDICATE_TEMPLATES: dict[str, Callable[[list[str]], list[dict[str, Any]]]] = {
     # Unary state changes
     "toggled_on": _template_unary_state,
     "open":       _template_unary_state,
@@ -248,9 +243,6 @@ GOAL_PREDICATE_TEMPLATES: dict[str, Callable[[list[str]], list[tuple[str, Callab
 # ---------------------------------------------------------------------------
 # Per-task BDDL goal predicates, extracted from
 # BEHAVIOR-1K/bddl3/bddl/activity_definitions/<task>/problem0.bddl
-# Object args are stripped of "?" prefixes and resolved to first concrete
-# instance ("_1") for type-only references. The full extraction lives in
-# this dict so the reward function never has to parse BDDL at runtime.
 # ---------------------------------------------------------------------------
 
 TASK_GOAL_PREDICATES: dict[str, list[tuple[str, list[str]]]] = {
@@ -371,7 +363,7 @@ TASK_GOAL_PREDICATES: dict[str, list[tuple[str, list[str]]]] = {
         ("ontop",   ["firewood.n.01_1", "newspaper.n.03_1"]),
         ("inside",  ["firewood.n.01_1", "wood_fireplace.n.01_1"]),
     ],
-    # 31..33: only `covered` predicates → no template coverage, no shaping
+    # 31..33: only `covered` predicates → no template coverage
     "clean_boxing_gloves": [],
     "wash_a_baseball_cap": [],
     "wash_dog_toys":       [],
@@ -414,21 +406,21 @@ TASK_GOAL_PREDICATES: dict[str, list[tuple[str, list[str]]]] = {
 
 # ---------------------------------------------------------------------------
 # Per-task hand-crafted overrides for tasks where the auto-template is
-# wrong/insufficient. Format: activity_name -> [(name, fn, bonus), ...].
-# Currently empty — adding entries here is the future expansion path for
-# tasks where the templates don't apply (covered/cooked/real-only goals).
+# wrong/insufficient. Format: activity_name -> list of subtask dicts (same
+# schema as template output). Currently empty — adding entries here is the
+# growth path for the 13 tasks with cooking/cleaning predicates that don't
+# fit the templates.
 # ---------------------------------------------------------------------------
 
-TASK_SUBTASKS_OVERRIDE: dict[str, list[tuple[str, Callable, float]]] = {}
+TASK_SUBTASKS_OVERRIDE: dict[str, list[dict[str, Any]]] = {}
 
 
 # ---------------------------------------------------------------------------
-# Resolver: activity_name → list of subtasks. Used by BehaviorSubtaskReward
-# at runtime. Priority: TASK_SUBTASKS_OVERRIDE > template-derived from
-# TASK_GOAL_PREDICATES > empty.
+# Resolver: activity_name → list of subtask dicts.
+# Priority: TASK_SUBTASKS_OVERRIDE > template-derived > empty.
 # ---------------------------------------------------------------------------
 
-def get_subtasks_for_task(activity_name: str) -> list[tuple[str, Callable, float]]:
+def get_subtasks_for_task(activity_name: str) -> list[dict[str, Any]]:
     """Return the subtask list for a given BEHAVIOR activity.
 
     Empty list means "no shaping for this task" — the BehaviorSubtaskReward
@@ -442,18 +434,18 @@ def get_subtasks_for_task(activity_name: str) -> list[tuple[str, Callable, float
     if not goal_predicates:
         return []
 
-    subtasks: list[tuple[str, Callable, float]] = []
+    subtasks: list[dict[str, Any]] = []
     seen_names: set[str] = set()
     for pred_name, args in goal_predicates:
         template = GOAL_PREDICATE_TEMPLATES.get(pred_name)
         if template is None:
             continue
         for entry in template(args):
-            name = entry[0]
+            name = entry["name"]
             if name in seen_names:
                 # De-duplicate across goal predicates that touch the same
                 # object (e.g. (ontop X Y) and (touching X Z) both emit
-                # near_X / grasping_X). First occurrence wins.
+                # near_X / grasping_X / delta_to_X). First occurrence wins.
                 continue
             seen_names.add(name)
             subtasks.append(entry)
@@ -465,54 +457,54 @@ def get_subtasks_for_task(activity_name: str) -> list[tuple[str, Callable, float
 # ---------------------------------------------------------------------------
 
 class BehaviorSubtaskReward(BaseRewardFunction):
-    """Latched per-subtask bonuses for a BEHAVIOR-1K activity.
+    """Latched per-subtask bonuses + continuous distance bridges for a
+    BEHAVIOR-1K activity.
 
     On first `_step` call, looks up the subtask list for the task's
-    activity_name via `get_subtasks_for_task`. Each subtask predicate is
-    checked every step. The first time a predicate becomes True within
-    an episode, its bonus is added (scaled by `scale`). After that, the
-    latch flag stays set and the same predicate emits 0 for the rest of
-    the episode. Reset clears all latch flags.
+    activity_name via `get_subtasks_for_task`. Then on each step:
+      - Latched subtasks: emit `bonus * scale` once on the first True
+        transition; subsequent steps emit 0 until reset.
+      - Continuous_delta subtasks: emit `(prev_dist - cur_dist) * coeff
+        * scale` per step until the gating latched subtask fires, then
+        contribute 0.
 
     If the activity has no registered subtasks (and no override), the
     reward is a no-op (returns 0.0 every step) — safe for tasks that
     haven't been decomposed yet.
 
     Args:
-        scale: global multiplier on all subtask bonuses. The per-subtask
-            bonus values from the templates are the "natural" magnitudes;
-            this lets users dial total shaping intensity up or down via
-            the YAML `r_subtask_bonus` config without editing code.
+        scale: global multiplier on all subtask reward components. The
+            per-subtask bonus values and coefficients in the templates
+            are the "natural" magnitudes; this lets users dial total
+            shaping intensity up or down via the YAML `r_subtask_bonus`
+            config without editing code.
     """
 
     def __init__(self, scale: float = 1.0):
         super().__init__()
         self._scale = float(scale)
-        self._subtasks: list[tuple[str, Callable, float]] = []
+        self._subtasks: list[dict[str, Any]] = []
         self._fired: dict[str, bool] = {}
-        self._activity_name: str | None = None
-        # DEBUG: confirm instantiation reaches here.
-        print(f"[BEHAVIOR_SUBTASK_DEBUG] BehaviorSubtaskReward.__init__(scale={scale})", flush=True)
+        self._prev_dists: dict[str, float] = {}
+        self._activity_name: Optional[str] = None
 
     def _ensure_loaded(self, task) -> None:
         if self._activity_name is not None:
             return
         self._activity_name = getattr(task, "activity_name", None) or "<unknown>"
         self._subtasks = get_subtasks_for_task(self._activity_name)
-        self._fired = {name: False for name, _, _ in self._subtasks}
-        # DEBUG: confirm _ensure_loaded reaches here AND logs in print form
-        # (the OmniGibson logger.info goes nowhere because root logger level is WARNING).
-        names = [n for n, _, _ in self._subtasks]
-        print(
-            f"[BEHAVIOR_SUBTASK_DEBUG] _ensure_loaded: activity='{self._activity_name}', "
-            f"n_subtasks={len(self._subtasks)}, names={names}, scale={self._scale}",
-            flush=True,
-        )
+        self._fired = {s["name"]: False for s in self._subtasks if s["kind"] == "latched"}
+        self._prev_dists = {}
         if self._subtasks:
-            ns = ", ".join(names)
+            counts = {"latched": 0, "continuous_delta": 0}
+            names = []
+            for s in self._subtasks:
+                counts[s["kind"]] = counts.get(s["kind"], 0) + 1
+                names.append(s["name"])
             logger.info(
                 f"BehaviorSubtaskReward enabled for activity '{self._activity_name}': "
-                f"{len(self._subtasks)} subtasks ({ns}), scale={self._scale}"
+                f"{counts['latched']} latched + {counts.get('continuous_delta', 0)} continuous "
+                f"({', '.join(names)}), scale={self._scale}"
             )
         else:
             logger.info(
@@ -526,23 +518,47 @@ class BehaviorSubtaskReward(BaseRewardFunction):
             return 0.0, {}
 
         total = 0.0
-        info: dict = {}
-        for name, fn, bonus in self._subtasks:
-            if self._fired[name]:
-                info[f"subtask_{name}"] = 1
-                continue
-            try:
-                achieved = bool(fn(task, env))
-            except Exception:
-                achieved = False
-            if achieved:
-                self._fired[name] = True
-                total += bonus * self._scale
-                info[f"subtask_{name}"] = 1
-            else:
-                info[f"subtask_{name}"] = 0
+        info: dict[str, Any] = {}
+
+        for subtask in self._subtasks:
+            kind = subtask["kind"]
+            name = subtask["name"]
+
+            if kind == "latched":
+                if self._fired.get(name, False):
+                    info[f"subtask_{name}"] = 1
+                    continue
+                try:
+                    achieved = bool(subtask["fn"](task, env))
+                except Exception:
+                    achieved = False
+                if achieved:
+                    self._fired[name] = True
+                    total += subtask["bonus"] * self._scale
+                    info[f"subtask_{name}"] = 1
+                else:
+                    info[f"subtask_{name}"] = 0
+
+            elif kind == "continuous_delta":
+                gate = subtask.get("gate_off_when")
+                if gate and self._fired.get(gate, False):
+                    # Milestone passed; bridge no longer active.
+                    continue
+                try:
+                    cur = subtask["dist_fn"](task, env)
+                except Exception:
+                    cur = None
+                if cur is None:
+                    continue
+                prev = self._prev_dists.get(name)
+                if prev is not None:
+                    delta_reward = (prev - cur) * subtask["coeff"] * self._scale
+                    total += delta_reward
+                self._prev_dists[name] = cur
+
         return total, info
 
     def reset(self, task, env):
         super().reset(task, env)
         self._fired = {name: False for name in self._fired}
+        self._prev_dists = {}

@@ -221,15 +221,6 @@ class BehaviorTask(BaseTask):
         # additively with PotentialReward (which still handles the BDDL
         # goal predicate). Set r_subtask_bonus > 0 to enable.
         subtask_scale = float(self._reward_config.get("r_subtask_bonus", 0.0) or 0.0)
-        # DEBUG: temporary one-shot diagnostic — confirm we reach _create_reward_functions
-        # and observe what reward_config contains.
-        print(
-            f"[BEHAVIOR_TASK_DEBUG] _create_reward_functions: activity={getattr(self, 'activity_name', '?')}, "
-            f"r_potential={self._reward_config.get('r_potential')}, "
-            f"r_subtask_bonus={subtask_scale}, "
-            f"reward_config_keys={list(self._reward_config.keys())}",
-            flush=True,
-        )
         if subtask_scale > 0:
             from omnigibson.reward_functions.behavior_subtask_reward import (
                 BehaviorSubtaskReward,
