@@ -212,22 +212,20 @@ class BehaviorTask(BaseTask):
             r_potential=self._reward_config["r_potential"],
         )
 
-        # Optional dense shaping: per-step distance from current EEF to an
-        # expert-demo EEF trajectory at the matching timestep. Provides a
-        # gradient signal for tasks where BDDL goal predicates are too
-        # coarse for a randomly-initialized policy to bootstrap from. Only
-        # active when the reward_config supplies both r_demo_dist_coeff and
-        # demo_eef_file.
-        demo_coeff = float(self._reward_config.get("r_demo_dist_coeff", 0.0) or 0.0)
-        demo_file = self._reward_config.get("demo_eef_file", None)
-        if demo_coeff > 0 and demo_file:
-            from omnigibson.reward_functions.demo_eef_distance_reward import (
-                DemoEEFDistanceReward,
+        # Optional latched per-subtask bonuses: provides a dense intermediate
+        # gradient signal for tasks where the BDDL goal predicate is too
+        # coarse for a randomly-initialized policy to ever stumble onto
+        # success. Each registered subtask predicate (see
+        # BehaviorSubtaskReward.TASK_SUBTASKS) fires its bonus once per
+        # episode the first time it becomes True (latched). Composes
+        # additively with PotentialReward (which still handles the BDDL
+        # goal predicate). Set r_subtask_bonus > 0 to enable.
+        subtask_scale = float(self._reward_config.get("r_subtask_bonus", 0.0) or 0.0)
+        if subtask_scale > 0:
+            from omnigibson.reward_functions.behavior_subtask_reward import (
+                BehaviorSubtaskReward,
             )
-            rewards["demo_eef_distance"] = DemoEEFDistanceReward(
-                demo_file=demo_file,
-                dist_coeff=demo_coeff,
-            )
+            rewards["subtask_bonus"] = BehaviorSubtaskReward(scale=subtask_scale)
 
         return rewards
 
@@ -698,10 +696,12 @@ class BehaviorTask(BaseTask):
     def default_reward_config(cls):
         return {
             "r_potential": 1.0,
-            # Optional dense shaping toward an expert-demo EEF trajectory.
-            # Both must be set to enable the reward; defaults are no-op
-            # so existing tasks/configs that don't use the dense shaping
-            # continue to work unchanged.
-            "r_demo_dist_coeff": 0.0,
-            "demo_eef_file": None,
+            # Optional latched per-subtask bonuses (see
+            # BehaviorSubtaskReward). Default is no-op so existing tasks
+            # and configs that don't use intermediate shaping continue to
+            # work unchanged. Set > 0 to enable; the per-subtask predicate
+            # list is registered per-task in
+            # omnigibson/reward_functions/behavior_subtask_reward.py
+            # (TASK_SUBTASKS dict).
+            "r_subtask_bonus": 0.0,
         }

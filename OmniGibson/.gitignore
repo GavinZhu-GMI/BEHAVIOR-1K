@@ -13,9 +13,6 @@ pw
 *.out
 npz/
 *.npy
-# Bundled expert-demo EEF trajectories used by DemoEEFDistanceReward.
-# Tracked in git so the dense shaping reward works out of the box.
-!omnigibson/reward_functions/demo_data/*.npy
 dev/transfer.c
 *.jpg
 *.png
