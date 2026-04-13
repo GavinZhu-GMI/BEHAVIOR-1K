@@ -109,7 +109,14 @@ task:
   highlight_task_relevant_objects: false
   use_presampled_robot_pose: true
   termination_config:
-    max_steps: 500
+    # Canonical BEHAVIOR challenge timeout: 2 × human_demo_mean_duration × 30fps.
+    # For turning_on_radio: 2 × 72s × 30 = 4320 steps.
+    # Source: BEHAVIOR-1K/docs/challenge/task_data.json ("duration": 72)
+    # and BEHAVIOR-1K/OmniGibson/omnigibson/learning/eval.py:146-150.
+    # Was 500 (BehaviorTask default placeholder) which caused episodes
+    # to terminate at step 500 while RLinf rollout ran for 2016 steps,
+    # producing ±1e15 reward spikes from NaN on dead-step physics.
+    max_steps: 4320
   reward_config:
     r_potential: 1.0
     # Latched per-subtask bonuses for sparse-reward bootstrapping. The

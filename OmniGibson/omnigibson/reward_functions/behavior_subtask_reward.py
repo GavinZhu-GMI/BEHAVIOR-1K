@@ -50,7 +50,7 @@ This reward composes additively with the existing PotentialReward
 bonuses + continuous bridges are intermediate stepping stones, not a
 replacement for the goal signal.
 """
-
+import math
 from typing import Any, Callable, Optional
 
 import torch as th
@@ -97,6 +97,8 @@ def _eef_to_obj_min_distance(task, env, obj_scope_name: str) -> Optional[float]:
         d = T.l2_distance(th.as_tensor(eef, dtype=th.float32), obj_t).item()
         if best is None or d < best:
             best = d
+    if best is None or not math.isfinite(best):
+        return None
     return best
 
 
@@ -553,7 +555,8 @@ class BehaviorSubtaskReward(BaseRewardFunction):
                 prev = self._prev_dists.get(name)
                 if prev is not None:
                     delta_reward = (prev - cur) * subtask["coeff"] * self._scale
-                    total += delta_reward
+                    if math.isfinite(delta_reward):
+                        total += delta_reward
                 self._prev_dists[name] = cur
 
         return total, info
